@@ -104,3 +104,6 @@ ENV/
 .idea/
 
 node_modules/
+
+# ctags
+tags
