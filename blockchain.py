@@ -1,3 +1,4 @@
+import os
 import sys
 import hashlib
 import json
@@ -353,17 +354,9 @@ class BlockchatJSONDecoder(JSONDecoder):
 app.json_encoder = BlockchatJSONEncoder
 app.json_decoder = BlockchatJSONDecoder
 
-# Generate a globally unique address for this node
-try:
-    with open("NODE_KEY.txt", "rb") as f:
-        node_secret = nacl.signing.SigningKey(f.read())
-except Exception as e:
-    print("Could not load secret key. Error:", e)
-    node_identifier, node_secret = encryption.generate_signing_key()
-    with open("NODE_KEY.txt", "wb") as f:
-        f.write(node_secret.encode())
-with open("NODE_ADDR.txt", "rt") as f:
-    node_url = f.read().strip()
+node_secret = nacl.signing.SigningKey(bytes.fromhex(os.getenv("NODE_KEY")))
+node_url = os.getenv("NODE_ADDR", None)
+assert node_url is not None
 node_identifier = encryption.encode_verify_key(node_secret.verify_key).decode()
 
 # Instantiate the Blockchain
