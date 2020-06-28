@@ -107,3 +107,10 @@ node_modules/
 
 # ctags
 tags
+
+# firebase secret
+firebase-adminsdk.json
+
+# cscope files
+cscope.out
+python_cscope.files
