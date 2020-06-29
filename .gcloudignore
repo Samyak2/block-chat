@@ -1,0 +1,9 @@
+# ctags
+tags
+
+# cscope files
+cscope.out
+python_cscope.files
+
+# git
+.git

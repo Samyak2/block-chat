@@ -12,14 +12,15 @@ COPY ./requirements.txt ./requirements.txt
 # Install production dependencies.
 RUN pip install -r ./requirements.txt
 
-# copy all code
-COPY . ./
-
 # Environment variables
 ARG node_url
 ARG node_secret
 ENV NODE_ADDR $node_url
 ENV NODE_KEY $node_secret
+ENV LOG_LEVEL WARNING
+
+# copy all code
+COPY . ./
 
 # Run the web service on container startup. Here we use the gunicorn
 # webserver, with one worker process and 8 threads.

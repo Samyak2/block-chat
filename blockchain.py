@@ -6,13 +6,22 @@ from time import time
 from urllib.parse import urlparse
 from typing import List
 import copy
+import logging
 
 import nacl
 import requests
 from flask import Flask, jsonify, request
 from flask.json import JSONEncoder, JSONDecoder
+from google.cloud import firestore
+import firebase_admin as firebase
+import firebase_admin.db as firebase_db
 
 import encryption
+
+numeric_level = getattr(logging, os.getenv("LOG_LEVEL"), "WARNING")
+if not isinstance(numeric_level, int):
+    raise ValueError('Invalid log level: %s' % os.getenv("LOG_LEVEL"))
+logging.basicConfig(level=numeric_level)
 
 class Transaction:
     """Wrapper class to represent a transaction
@@ -53,7 +62,7 @@ class Transaction:
             sender_key = encryption.decode_verify_key(self.sender)
             encryption.decode_verify_key(self.receiver)
         except (ValueError, TypeError) as e:
-            print("Error while verifying transaction:", e)
+            logging.error(f"Error while verifying transaction: {e}")
             return False
         return encryption.verify_message(sender_key,
                                          bytes(repr(self), 'utf-8'),
@@ -61,13 +70,21 @@ class Transaction:
 
 class Blockchain:
     """Represents the entire blockchain present in a node"""
-    def __init__(self):
-        self.current_transactions = []
-        self.chain = []
-        self.nodes = set()
+    def __init__(self, con_ref: firestore.CollectionReference,
+                 node_ref: firestore.CollectionReference,
+                 tx_ref: firebase_db.Reference):
+        self.node_ref = node_ref
+        self.con_ref = con_ref
+        self.tx_ref = tx_ref
+        try:
+            stream = con_ref.where("index", "==", 1).limit(1).stream()
+            next(stream)
+        except StopIteration:
+            logging.warning("Genesis block does not exist on database. Creating...")
 
-        # Create the genesis block
-        self.new_block(previous_hash='1', proof=100, transactions=[], verify=False)
+            # Create the genesis block
+            self.new_block(previous_hash='1', proof=100, transactions=[],
+                           last_block={"index": 0}, verify=False)
 
     def register_node(self, address):
         """
@@ -76,15 +93,17 @@ class Blockchain:
         :param address: Address of node. Eg. 'http://192.168.0.5:5000'
         """
 
-        parsed_url = urlparse(address)
-        if parsed_url.netloc:
-            self.nodes.add(parsed_url.netloc)
-        elif parsed_url.path:
-            # Accepts an URL without scheme like '192.168.0.5:5000'.
-            self.nodes.add(parsed_url.path)
-        else:
-            raise ValueError('Invalid URL')
+        parsed_url = parse_node_addr(address)
+        new_node_doc_ref = self.node_ref.document()
+        new_node_doc_ref.set({"node_addr": parsed_url})
 
+    def get_nodes(self):
+        """Returns a set of all registered node"""
+        nodes = set()
+        for node_doc_ref in self.node_ref.list_documents():
+            node_doc = node_doc_ref.get().to_dict()
+            nodes.add(node_doc["node_addr"])
+        return nodes
 
     def valid_chain(self, chain):
         """
@@ -99,29 +118,37 @@ class Blockchain:
 
         while current_index < len(chain):
             block = chain[current_index]
-            print(f'{last_block}')
-            print(f'{block}')
-            print("\n-----------\n")
+            logging.info('%s', last_block)
+            logging.info('%s', block)
+            logging.info("\n-----------\n")
             # Check that the hash of the block is correct
             last_block_hash = self.hash(last_block)
             if block['previous_hash'] != last_block_hash:
-                print(f"Invalid block hash at index {current_index}", file=sys.stderr)
+                logging.warning("Invalid block hash at index %s", current_index)
                 return False
 
             # Check that the Proof of Work is correct
             if not self.valid_proof(last_block['proof'], last_block_hash, block['proof'],
                                     block["transactions"]):
-                print(f"Invalid proof of work at index {current_index}", file=sys.stderr)
+                logging.warning("Invalid proof of work at index %s", current_index)
                 return False
             for transaction in block["transactions"]:
                 if not transaction.verify_transaction():
-                    print(f"Invalid transaction at index {current_index}", file=sys.stderr)
+                    logging.warning("Invalid transaction at index %s", current_index)
                     return False
 
             last_block = block
             current_index += 1
 
         return True
+
+    @property
+    def current_chain(self):
+        """Returns a list of the current blockchain"""
+        stream = self.con_ref.order_by("index", direction="ASCENDING").stream()
+        chain = [dr.to_dict() for dr in stream]
+        chain = [self.deserialise_transactions(block) for block in chain]
+        return chain
 
     def replace_chain(self, chain: List):
         """Replaces the blockchain with the longer (valid) "chain"
@@ -130,16 +157,19 @@ class Blockchain:
         Arguments:
         chain: chain to replace with
         """
-        assert len(self.chain) < len(chain)
         leftout_txs = []
-        min_len = len(self.chain)
         i = 1
+        current_chain = self.current_chain
+        min_len = len(current_chain)
         while i < min_len:
-            if self.hash(self.chain[i]) != self.hash(chain[i]):
-                leftout_txs.extend(self.chain[i]["transactions"])
+            if self.hash(current_chain[i]) != self.hash(chain[i]):
+                leftout_txs.extend(current_chain[i]["transactions"])
             i += 1
-        self.current_transactions.extend(leftout_txs)
-        self.chain = chain
+        other_len = len(chain)
+        while i < other_len:
+            self.add_block(chain[i])
+            i += 1
+        self.append_transactions(leftout_txs)
         return True
 
     def resolve_conflicts(self):
@@ -150,11 +180,11 @@ class Blockchain:
         :return: True if our chain was replaced, False if not
         """
 
-        neighbours = self.nodes
+        neighbours = self.get_nodes()
         new_chain = None
 
         # We're only looking for chains longer than ours
-        max_length = len(self.chain)
+        max_length = len(self)
 
         # Grab and verify the chains from all the nodes in our network
         for node in neighbours:
@@ -168,12 +198,11 @@ class Blockchain:
                     if chain_response.status_code == 200:
                         chain = chain_response.json(cls=BlockchatJSONDecoder)['chain']
                         # Check if the chain is valid
-                        print(chain)
                         if self.valid_chain(chain):
                             max_length = length
                             new_chain = chain
                         else:
-                            print(f"Invalid chain on node {node}")
+                            logging.error("Invalid chain on node %s", node)
 
         # Replace our chain if we discovered a new, valid chain longer than ours
         if new_chain:
@@ -182,7 +211,7 @@ class Blockchain:
 
         return False
 
-    def new_block(self, proof, previous_hash, transactions, verify=True):
+    def new_block(self, proof, previous_hash, transactions, last_block, verify=True):
         """
         Create a new Block in the Blockchain
 
@@ -192,35 +221,33 @@ class Blockchain:
         """
 
         block = {
-            'index': len(self.chain) + 1,
+            'index': last_block["index"] + 1,
             'timestamp': time(),
             'transactions': transactions,
             'proof': proof,
-            'previous_hash': previous_hash or self.hash(self.chain[-1]),
+            'previous_hash': previous_hash or self.hash(last_block),
             'source_node': node_url
         }
-
-        # Reset the current list of transactions
-        self.current_transactions = []
 
         if verify:
             self.add_block(block)
             self.publish_block(block)
         else:
-            self.chain.append(block)
+            self.serialise_transactions(block)
+            self.con_ref.document(str(block["index"])).set(block)
         return block
 
     def publish_block(self, block):
         """Publishes block to all nodes"""
         headers = {'Content-type': 'application/json', 'Accept': 'text/plain'}
-        for node in self.nodes:
+        for node in self.get_nodes():
             if node != block["source_node"]:
                 response = requests.post(f'http://{node}/add_block',
                                          data=json.dumps({"block": block},
                                                          cls=BlockchatJSONEncoder),
                                          headers=headers)
                 if not response.ok:
-                    print(f"Could not publish block to node {node}", file=sys.stderr)
+                    logging.warning(f"Could not publish block to node {node}")
 
 
     def add_block(self, block):
@@ -243,8 +270,21 @@ class Blockchain:
         if not self.valid_proof(last_proof, last_hash, block["proof"], block["transactions"]):
             return False
 
-        self.chain.append(block)
+        self.serialise_transactions(block)
+        self.con_ref.document(str(block["index"])).set(block)
         return True
+
+    def pop_transactions(self) -> List[Transaction]:
+        txs = self.tx_ref.get()
+        transactions = []
+        for key, value in txs.items():
+            self.tx_ref.child(key).delete()
+            transactions.append(Transaction(**value))
+        return transactions
+
+    def append_transactions(self, transactions: List[Transaction]):
+        for transaction in transactions:
+            self.tx_ref.push(transaction.to_dict())
 
     def new_transaction(self, sender: bytes, recipient: bytes, message: str,
                         signature: bytes = None, self_sign: bool = False,
@@ -258,7 +298,6 @@ class Blockchain:
         :return: The index of the Block that will hold this transaction
         """
         transaction = Transaction(sender, recipient, message, signature)
-        print(transaction)
         if signature is None and self_sign is True:
             message, signature = encryption.sign_message(node_secret, repr(transaction))
             transaction.signature = signature
@@ -266,14 +305,34 @@ class Blockchain:
             return False
 
         if add_to is None:
-            add_to = self.current_transactions
-        add_to.append(transaction)
+            self.append_transactions([transaction])
+        else:
+            add_to.append(transaction)
 
-        return self.last_block['index'] + 1
+        return True
 
     @property
     def last_block(self):
-        return self.chain[-1]
+        """The last added block in the chain"""
+        stream = self.con_ref.order_by("index", direction="DESCENDING").limit(1).stream()
+        block = next(stream).to_dict()
+        self.deserialise_transactions(block)
+        return block
+
+    def __len__(self):
+        return self.last_block["index"]
+
+    @staticmethod
+    def serialise_transactions(block: dict):
+        """Convert all Transactions of the block to dicts"""
+        block["transactions"] = list(map(lambda x: x.to_dict(), block["transactions"]))
+        return block
+
+    @staticmethod
+    def deserialise_transactions(block: dict):
+        """Convert all transaction dicts in the block to Transaction objects"""
+        block["transactions"] = list(map(lambda x: Transaction(**x), block["transactions"]))
+        return block
 
     @staticmethod
     def hash(block):
@@ -323,10 +382,16 @@ class Blockchain:
         guess = f'{last_proof}{proof}{last_hash}{transactions_representation}'.encode()
         guess_hash = hashlib.sha256(guess).hexdigest()
         ret = guess_hash[:4] == "0000"
-        if ret:
-            print("Guess:", guess)
+        # if ret:
+        #     print("Guess:", guess)
         return ret
 
+def parse_node_addr(addr):
+    """Formats the URL to have only scheme and hostname (with port)"""
+    parsed_url = urlparse(addr)
+    if parsed_url.scheme and parsed_url.netloc:
+        return f"{parsed_url.scheme}://{parsed_url.netloc}"
+    raise ValueError("Invalid URL")
 
 # Instantiate the Node
 app = Flask(__name__)
@@ -354,14 +419,28 @@ class BlockchatJSONDecoder(JSONDecoder):
 app.json_encoder = BlockchatJSONEncoder
 app.json_decoder = BlockchatJSONDecoder
 
+# load node secret and node address from env vars
 node_secret = nacl.signing.SigningKey(bytes.fromhex(os.getenv("NODE_KEY")))
 node_url = os.getenv("NODE_ADDR", None)
 assert node_url is not None
+node_url = parse_node_addr(node_url)
 node_identifier = encryption.encode_verify_key(node_secret.verify_key).decode()
 
-# Instantiate the Blockchain
-blockchain = Blockchain()
+db = firestore.Client.from_service_account_json("./firebase-adminsdk.json")
+blockchain_c = db.collection("blockchain")
+node_c = db.collection("nodes")
+logging.info("Firestore connected")
 
+firebase.initialize_app(firebase.credentials.Certificate("./firebase-adminsdk.json"), {
+    "databaseURL": "https://blockchat-node-01.firebaseio.com/",
+    "databaseAuthVariableOverride": {
+        "uid": "blockchat"
+    }
+})
+transactions_ref = firebase_db.reference("/transactions")
+
+# Instantiate the Blockchain
+blockchain = Blockchain(blockchain_c, node_c, transactions_ref)
 
 @app.route('/mine', methods=['GET'])
 def mine():
@@ -370,7 +449,7 @@ def mine():
 
     last_block = blockchain.last_block
     # get the transactions to be added
-    transactions = copy.deepcopy(blockchain.current_transactions)
+    transactions = blockchain.pop_transactions()
     # add a "mine" transaction
     blockchain.new_transaction(node_identifier, node_identifier, "<<MINE>>",
                                self_sign=True, add_to=transactions)
@@ -380,7 +459,7 @@ def mine():
 
     # Forge the new Block by adding it to the chain
     previous_hash = blockchain.hash(last_block)
-    block = blockchain.new_block(proof, previous_hash, transactions)
+    block = blockchain.new_block(proof, previous_hash, transactions, last_block)
 
     response = {
         'message': "New Block Forged",
@@ -407,22 +486,23 @@ def new_transaction():
     if not index:
         return "Cannot verify transaction", 400
 
-    response = {'message': f'Transaction will be added to Block {index}'}
+    response = {'message': f'Transaction will be added to the next block.'}
     return jsonify(response), 201
 
 
 @app.route('/chain', methods=['GET'])
 def full_chain():
+    chain = blockchain.current_chain
     response = {
-        'chain': blockchain.chain,
-        'length': len(blockchain.chain),
+        'chain': chain,
+        'length': chain[-1]["index"]
     }
     return jsonify(response), 200
 
 @app.route('/chain_length', methods=['GET'])
 def chain_length():
     response = {
-        'length': len(blockchain.chain),
+        'length': len(blockchain),
     }
     return jsonify(response), 200
 
@@ -450,11 +530,12 @@ def register_nodes():
     for node in nodes:
         blockchain.register_node(node)
 
-    blockchain.resolve_conflicts()
+    replaced = blockchain.resolve_conflicts()
 
     response = {
         'message': 'New nodes have been added',
-        'total_nodes': list(blockchain.nodes),
+        'total_nodes': list(blockchain.get_nodes()),
+        'chain_replaced': replaced
     }
     return jsonify(response), 201
 
@@ -462,17 +543,14 @@ def register_nodes():
 @app.route('/nodes/resolve', methods=['GET'])
 def consensus():
     replaced = blockchain.resolve_conflicts()
-    print("Replaced:", replaced)
 
     if replaced:
         response = {
-            'message': 'Our chain was replaced',
-            'new_chain': blockchain.chain
+            'message': 'Our chain was replaced'
         }
     else:
         response = {
-            'message': 'Our chain is authoritative',
-            'chain': blockchain.chain
+            'message': 'Our chain is authoritative'
         }
 
     return jsonify(response), 200
