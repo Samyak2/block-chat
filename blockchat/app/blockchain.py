@@ -1,11 +1,9 @@
 import os
-import sys
 import hashlib
 import json
 from time import time
 from urllib.parse import urlparse
 from typing import List
-import copy
 import logging
 
 import nacl
@@ -17,7 +15,7 @@ import firebase_admin as firebase
 import firebase_admin.db as firebase_db
 from flask_cors import CORS
 
-import encryption
+from blockchat.utils import encryption
 
 numeric_level = getattr(logging, os.getenv("LOG_LEVEL"), "WARNING")
 if not isinstance(numeric_level, int):
@@ -249,7 +247,7 @@ class Blockchain:
                                                          cls=BlockchatJSONEncoder),
                                          headers=headers)
                 if not response.ok:
-                    logging.warning(f"Could not publish block to node {node}")
+                    logging.warning("Could not publish block to node %s", node)
 
 
     def add_block(self, block):
