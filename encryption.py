@@ -1,4 +1,3 @@
-import nacl.encoding
 import nacl.signing
 import nacl.exceptions
 import nacl.utils
@@ -19,13 +18,13 @@ def generate_signing_key() -> (nacl.signing.VerifyKey, nacl.signing.SigningKey):
 
     return verify_key, signing_key
 
-def encode_verify_key(verify_key: nacl.signing.VerifyKey) -> bytes:
+def encode_verify_key(verify_key: nacl.signing.VerifyKey) -> str:
     """Encodes given verify_key into a bytes object"""
-    return verify_key.encode(encoder=nacl.encoding.HexEncoder)
+    return verify_key.encode().hex()
 
-def decode_verify_key(verify_key_hex: bytes) -> nacl.signing.VerifyKey:
+def decode_verify_key(verify_key_hex: str) -> nacl.signing.VerifyKey:
     """Decodes given verify_key_hex into a verify_key"""
-    return nacl.signing.VerifyKey(verify_key_hex, encoder=nacl.encoding.HexEncoder)
+    return nacl.signing.VerifyKey(bytes.fromhex(verify_key_hex))
 
 def sign_message(signing_key: nacl.signing.SigningKey, message):
     """Signs message using signing_key"""

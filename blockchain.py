@@ -15,6 +15,7 @@ from flask.json import JSONEncoder, JSONDecoder
 from google.cloud import firestore
 import firebase_admin as firebase
 import firebase_admin.db as firebase_db
+from flask_cors import CORS
 
 import encryption
 
@@ -57,6 +58,7 @@ class Transaction:
         <sender_public_key receiver_public_key message>
         """
         if self.signature is None:
+            print("No signature")
             return False
         try:
             sender_key = encryption.decode_verify_key(self.sender)
@@ -395,6 +397,7 @@ def parse_node_addr(addr):
 
 # Instantiate the Node
 app = Flask(__name__)
+CORS(app)
 
 # custom JSONEncoder for our custom classes
 class BlockchatJSONEncoder(JSONEncoder):
@@ -424,7 +427,7 @@ node_secret = nacl.signing.SigningKey(bytes.fromhex(os.getenv("NODE_KEY")))
 node_url = os.getenv("NODE_ADDR", None)
 assert node_url is not None
 node_url = parse_node_addr(node_url)
-node_identifier = encryption.encode_verify_key(node_secret.verify_key).decode()
+node_identifier = encryption.encode_verify_key(node_secret.verify_key)
 
 db = firestore.Client.from_service_account_json("./firebase-adminsdk.json")
 blockchain_c = db.collection("blockchain")
