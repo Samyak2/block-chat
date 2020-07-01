@@ -3,16 +3,14 @@ import logging
 
 import nacl
 from flask import Flask, jsonify, request
-from google.cloud import firestore
-import firebase_admin as firebase
-import firebase_admin.db as firebase_db
 from flask_cors import CORS
 
 from blockchat.utils import encryption
 from blockchat.types.blockchain import Blockchain, BlockchatJSONEncoder, BlockchatJSONDecoder
 from blockchat.types.blockchain import parse_node_addr
+import blockchat.utils.storage as storage
 
-numeric_level = getattr(logging, os.getenv("LOG_LEVEL"), "WARNING")
+numeric_level = getattr(logging, os.getenv("LOG_LEVEL", "WARNING"), "WARNING")
 if not isinstance(numeric_level, int):
     raise ValueError('Invalid log level: %s' % os.getenv("LOG_LEVEL"))
 logging.basicConfig(level=numeric_level)
@@ -31,21 +29,16 @@ assert node_url is not None
 node_url = parse_node_addr(node_url)
 node_identifier = encryption.encode_verify_key(node_secret.verify_key)
 
-db = firestore.Client.from_service_account_json("./firebase-adminsdk.json")
-blockchain_c = db.collection("blockchain")
-node_c = db.collection("nodes")
-logging.info("Firestore connected")
-
-firebase.initialize_app(firebase.credentials.Certificate("./firebase-adminsdk.json"), {
-    "databaseURL": "https://blockchat-node-01.firebaseio.com/",
-    "databaseAuthVariableOverride": {
-        "uid": "blockchat"
-    }
-})
-transactions_ref = firebase_db.reference("/transactions")
+storage_backend = os.getenv("STORAGE_TYPE", "memory").lower()
+if storage_backend == "firebase":
+    db = storage.FirebaseBlockchatStorage()
+    logging.warning("Using Firebase storage backend")
+else:
+    db = storage.InMemoryBlockchatStorage()
+    logging.warning("Using in-memory storage backend")
 
 # Instantiate the Blockchain
-blockchain = Blockchain(blockchain_c, node_c, transactions_ref, node_url, node_secret)
+blockchain = Blockchain(db, node_url, node_secret)
 
 @app.route('/mine', methods=['GET'])
 def mine():
@@ -54,7 +47,7 @@ def mine():
 
     last_block = blockchain.last_block
     # get the transactions to be added
-    transactions = blockchain.pop_transactions()
+    transactions = blockchain.db.pop_transactions()
     # add a "mine" transaction
     blockchain.new_transaction(node_identifier, node_identifier, "<<MINE>>",
                                self_sign=True, add_to=transactions)
@@ -97,7 +90,7 @@ def new_transaction():
 
 @app.route('/chain', methods=['GET'])
 def full_chain():
-    chain = blockchain.current_chain
+    chain = blockchain.db.chain
     response = {
         'chain': chain,
         'length': chain[-1]["index"]

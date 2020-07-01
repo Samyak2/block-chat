@@ -8,20 +8,21 @@ from urllib.parse import urlparse
 
 from flask.json import JSONEncoder, JSONDecoder
 import nacl.signing
-from google.cloud import firestore
-import firebase_admin as firebase
-import firebase_admin.db as firebase_db
 import requests
 
-from blockchat.utils import encryption
+import blockchat.utils.encryption as encryption
+import blockchat.utils.storage as storage
+from blockchat.types.transaction import Transaction
 
 # custom JSONEncoder for our custom classes
 class BlockchatJSONEncoder(JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, Transaction):
-            return obj.to_dict()
-        return super(BlockchatJSONEncoder, self).default(obj)
+    """Custom JSON encoder to encode Transactions correctly"""
+    def default(self, o):
+        if isinstance(o, Transaction):
+            return o.to_dict()
+        return super(BlockchatJSONEncoder, self).default(o)
 class BlockchatJSONDecoder(JSONDecoder):
+    """Custom JSON decoder to decode Transactions correctly"""
     def __init__(self, *args, **kwargs):
         self.orig_obj_hook = kwargs.pop("object_hook", None)
         super(BlockchatJSONDecoder, self).__init__(
@@ -29,6 +30,7 @@ class BlockchatJSONDecoder(JSONDecoder):
             object_hook=self.custom_obj_hook, **kwargs)
 
     def custom_obj_hook(self, dct):
+        """Custom decode function for Transaction"""
         # Calling custom decode function:
         if "sender" in dct and "receiver" in dct and "sender" in dct and "signature" in dct:
             dct = Transaction(dct["sender"], dct["receiver"], dct["message"], dct["signature"])
@@ -36,70 +38,15 @@ class BlockchatJSONDecoder(JSONDecoder):
             return self.orig_obj_hook(dct)  # Yes: then do it
         return dct  # No: just return the decoded dict
 
-class Transaction:
-    """Wrapper class to represent a transaction
-
-    Arguments:
-    sender (bytes): sender public key
-    receiver (bytes): receiver public key
-    message (str): message to be sent
-    """
-    def __init__(self, sender: bytes, receiver: bytes, message: str, signature: str = None):
-        self.sender = sender
-        self.receiver = receiver
-        self.message = message
-        self.signature = signature
-        if signature is not None:
-            self.signature = bytes.fromhex(signature)
-
-    def __repr__(self):
-        return f"<{self.sender} {self.receiver} {self.message}>"
-
-    def to_dict(self):
-        return {
-            "sender": self.sender,
-            "receiver": self.receiver,
-            "message": self.message,
-            "signature": self.signature.hex()
-        }
-
-    def verify_transaction(self):
-        """Returns True if the signature is valid for this Transaction, returns False otherwise.
-
-        The message which the signature represents should be of the following form:
-        <sender_public_key receiver_public_key message>
-        """
-        if self.signature is None:
-            print("No signature")
-            return False
-        try:
-            sender_key = encryption.decode_verify_key(self.sender)
-            encryption.decode_verify_key(self.receiver)
-        except (ValueError, TypeError) as e:
-            logging.error("Error while verifying transaction: %s", e)
-            return False
-        return encryption.verify_message(sender_key,
-                                         bytes(repr(self), 'utf-8'),
-                                         self.signature)
-
 class Blockchain:
     """Represents the entire blockchain present in a node"""
-    def __init__(self, con_ref: firestore.CollectionReference,
-                 node_ref: firestore.CollectionReference,
-                 tx_ref: firebase_db.Reference,
+    def __init__(self, db: storage.BlockchatStorage,
                  node_url: str,
                  node_secret: nacl.signing.SigningKey):
-        self.node_ref = node_ref
-        self.con_ref = con_ref
-        self.tx_ref = tx_ref
+        self.db = db
         self.node_url = node_url
         self.node_secret = node_secret
-        try:
-            stream = con_ref.where("index", "==", 1).limit(1).stream()
-            next(stream)
-        except StopIteration:
-            logging.warning("Genesis block does not exist on database. Creating...")
-
+        if not db.genesis_present():
             # Create the genesis block
             self.new_block(previous_hash='1', proof=100, transactions=[],
                            last_block={"index": 0}, verify=False)
@@ -112,16 +59,11 @@ class Blockchain:
         """
 
         parsed_url = parse_node_addr(address)
-        new_node_doc_ref = self.node_ref.document()
-        new_node_doc_ref.set({"node_addr": parsed_url})
+        self.db.add_node(parsed_url)
 
     def get_nodes(self):
         """Returns a set of all registered node"""
-        nodes = set()
-        for node_doc_ref in self.node_ref.list_documents():
-            node_doc = node_doc_ref.get().to_dict()
-            nodes.add(node_doc["node_addr"])
-        return nodes
+        return self.db.nodes
 
     def valid_chain(self, chain):
         """
@@ -160,14 +102,6 @@ class Blockchain:
 
         return True
 
-    @property
-    def current_chain(self):
-        """Returns a list of the current blockchain"""
-        stream = self.con_ref.order_by("index", direction="ASCENDING").stream()
-        chain = [dr.to_dict() for dr in stream]
-        chain = [self.deserialise_transactions(block) for block in chain]
-        return chain
-
     def replace_chain(self, chain: List):
         """Replaces the blockchain with the longer (valid) "chain"
         Note that validity isn't checked here
@@ -177,7 +111,7 @@ class Blockchain:
         """
         leftout_txs = []
         i = 1
-        current_chain = self.current_chain
+        current_chain = self.db.chain
         min_len = len(current_chain)
         while i < min_len:
             if self.hash(current_chain[i]) != self.hash(chain[i]):
@@ -187,7 +121,7 @@ class Blockchain:
         while i < other_len:
             self.add_block(chain[i])
             i += 1
-        self.append_transactions(leftout_txs)
+        self.db.append_transactions(leftout_txs)
         return True
 
     def resolve_conflicts(self):
@@ -251,8 +185,7 @@ class Blockchain:
             self.add_block(block)
             self.publish_block(block)
         else:
-            self.serialise_transactions(block)
-            self.con_ref.document(str(block["index"])).set(block)
+            self.db.add_block(block)
         return block
 
     def publish_block(self, block):
@@ -288,21 +221,8 @@ class Blockchain:
         if not self.valid_proof(last_proof, last_hash, block["proof"], block["transactions"]):
             return False
 
-        self.serialise_transactions(block)
-        self.con_ref.document(str(block["index"])).set(block)
+        self.db.add_block(block)
         return True
-
-    def pop_transactions(self) -> List[Transaction]:
-        txs = self.tx_ref.get()
-        transactions = []
-        for key, value in txs.items():
-            self.tx_ref.child(key).delete()
-            transactions.append(Transaction(**value))
-        return transactions
-
-    def append_transactions(self, transactions: List[Transaction]):
-        for transaction in transactions:
-            self.tx_ref.push(transaction.to_dict())
 
     def new_transaction(self, sender: bytes, recipient: bytes, message: str,
                         signature: bytes = None, self_sign: bool = False,
@@ -323,7 +243,7 @@ class Blockchain:
             return False
 
         if add_to is None:
-            self.append_transactions([transaction])
+            self.db.append_transactions([transaction])
         else:
             add_to.append(transaction)
 
@@ -332,25 +252,10 @@ class Blockchain:
     @property
     def last_block(self):
         """The last added block in the chain"""
-        stream = self.con_ref.order_by("index", direction="DESCENDING").limit(1).stream()
-        block = next(stream).to_dict()
-        self.deserialise_transactions(block)
-        return block
+        return self.db.last_block
 
     def __len__(self):
         return self.last_block["index"]
-
-    @staticmethod
-    def serialise_transactions(block: dict):
-        """Convert all Transactions of the block to dicts"""
-        block["transactions"] = list(map(lambda x: x.to_dict(), block["transactions"]))
-        return block
-
-    @staticmethod
-    def deserialise_transactions(block: dict):
-        """Convert all transaction dicts in the block to Transaction objects"""
-        block["transactions"] = list(map(lambda x: Transaction(**x), block["transactions"]))
-        return block
 
     @staticmethod
     def hash(block):
