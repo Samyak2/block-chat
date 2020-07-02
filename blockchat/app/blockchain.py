@@ -1,9 +1,11 @@
 import os
 import logging
+import atexit
 
 import nacl
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from blockchat.utils import encryption
 from blockchat.types.blockchain import Blockchain, BlockchatJSONEncoder, BlockchatJSONDecoder
@@ -40,8 +42,10 @@ else:
 # Instantiate the Blockchain
 blockchain = Blockchain(db, node_url, node_secret)
 
-@app.route('/mine', methods=['GET'])
-def mine():
+def mine_wrapper():
+    if blockchain.db.num_transactions() == 0:
+        return False
+    logging.info("Mining now")
     # ensure chain is the best before mining
     blockchain.resolve_conflicts()
 
@@ -58,6 +62,14 @@ def mine():
     # Forge the new Block by adding it to the chain
     previous_hash = blockchain.hash(last_block)
     block = blockchain.new_block(proof, previous_hash, transactions, last_block)
+
+    return block
+
+@app.route('/mine', methods=['GET'])
+def mine():
+    block = mine_wrapper()
+    if not block:
+        return "Nothing to mine", 200
 
     response = {
         'message': "New Block Forged",
@@ -79,14 +91,30 @@ def new_transaction():
         return 'Missing values', 400
 
     # Create a new Transaction
-    index = blockchain.new_transaction(values['sender'], values['recipient'],
-                                       values['message'], values['signature'])
-    if not index:
+    tag = blockchain.new_transaction(values['sender'], values['recipient'],
+                                     values['message'], values['signature'])
+    if not tag:
         return "Cannot verify transaction", 400
 
-    response = {'message': f'Transaction will be added to the next block.'}
+    response = {'message': 'Transaction will be added to the next block.',
+                'tag': tag}
     return jsonify(response), 201
 
+@app.route('/transactions/is_unconfirmed', methods=['GET'])
+def check_transaction_unconfirmed():
+    if 'tag' not in request.args:
+        return 'Missing tag in parameters', 400
+    tag = request.args.get('tag')
+    unconfirmed = blockchain.db.is_transaction_unconfirmed(tag)
+    return jsonify({"unconfirmed": unconfirmed}), 201
+
+@app.route('/transactions/is_confirmed', methods=['GET'])
+def check_transaction_confirmed():
+    if 'tag' not in request.args:
+        return 'Missing tag in parameters', 400
+    tag = request.args.get('tag')
+    confirmed = blockchain.db.is_transaction_confirmed(tag)
+    return jsonify({"confirmed": confirmed}), 201
 
 @app.route('/chain', methods=['GET'])
 def full_chain():
@@ -153,6 +181,13 @@ def consensus():
 
     return jsonify(response), 200
 
+# schedule mine job every x minutes
+sched = BackgroundScheduler(daemon=True)
+sched.add_job(mine_wrapper, 'interval', minutes=1)
+sched.start()
+
+# shutdown scheduler when exiting
+atexit.register(lambda: sched.shutdown(wait=False))
 
 if __name__ == '__main__':
     from argparse import ArgumentParser

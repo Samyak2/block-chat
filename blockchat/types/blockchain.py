@@ -33,7 +33,10 @@ class BlockchatJSONDecoder(JSONDecoder):
         """Custom decode function for Transaction"""
         # Calling custom decode function:
         if "sender" in dct and "receiver" in dct and "sender" in dct and "signature" in dct:
-            dct = Transaction(dct["sender"], dct["receiver"], dct["message"], dct["signature"])
+            new_dct = Transaction(dct["sender"], dct["receiver"], dct["message"], dct["signature"])
+            if "tag" in dct:
+                new_dct.tag = dct["tag"]
+            dct = new_dct
         if self.orig_obj_hook:  # Do we have another hook to call?
             return self.orig_obj_hook(dct)  # Yes: then do it
         return dct  # No: just return the decoded dict
@@ -243,11 +246,14 @@ class Blockchain:
             return False
 
         if add_to is None:
-            self.db.append_transactions([transaction])
+            tags = self.db.append_transactions([transaction])
+            tag = tags[0]
         else:
             add_to.append(transaction)
+            tag = None
+        transaction.tag = tag
 
-        return True
+        return tag
 
     @property
     def last_block(self):

@@ -7,7 +7,7 @@ Current plan:
 import abc
 import logging
 from typing import List, Dict, Set
-import copy
+import uuid
 
 from google.cloud import firestore
 import firebase_admin as firebase
@@ -71,7 +71,14 @@ class BlockchatStorage(abc.ABC):
     def append_transactions(self, transactions):
         """Adds a list of unconfirmed transactions
 
-        :param transactions:
+        :param transactions: transactions to add
+        :type transactions: List of :class:`~blockchat.type.transaction.Transaction`
+            objects
+
+        :return: A list of tags that can be used to check if the transactions are still
+            unconfirmed using
+            :func:`~blockchat.utils.storage.BlockchatStorage.is_transaction_unconfirmed`
+        :rtype: list of str
         """
         raise NotImplementedError
 
@@ -86,6 +93,44 @@ class BlockchatStorage(abc.ABC):
         """Convert all transaction dicts in the block to Transaction objects"""
         block["transactions"] = list(map(lambda x: Transaction(**x), block["transactions"]))
         return block
+
+    @abc.abstractmethod
+    def is_transaction_unconfirmed(self, tag):
+        """Returns True if transaction is in unconfirmed transactions.
+        Note: Does not say anything about the transaction being confirmed.
+
+        :param tag: A transaction tag returned by
+            :func:`~blockchat.utils.storage.BlockchatStorage.append_transactions`
+        :type tag: str
+
+        :return: boolean indicating whether transaction is unconfirmed or not
+        :rtype: bool
+        """
+        return NotImplementedError
+
+    @abc.abstractmethod
+    def is_transaction_confirmed(self, tag):
+        """Returns True if transaction is in a mined block.
+        Note: Use :func:`~blockchat.utils.storage.BlockchatStorage.is_transaction_unconfirmed`
+            if the transaction was newly added, use this function only after that one
+            returns False.
+
+        :param tag: A transaction tag returned by
+            :func:`~blockchat.utils.storage.BlockchatStorage.append_transactions`
+        :type tag: str
+
+        :return: boolean indicating whether transaction is confirmed or not
+        :rtype: bool
+        """
+        return NotImplementedError
+
+    @abc.abstractmethod
+    def num_transactions(self):
+        """Returns the number of unconfirmed transactions
+
+        :rtype: integer
+        """
+        return NotImplementedError
 
 class FirebaseBlockchatStorage(BlockchatStorage):
     """Blockchain storage provider with Firebase firestore and realtime database"""
@@ -152,14 +197,27 @@ class FirebaseBlockchatStorage(BlockchatStorage):
         return transactions
 
     def append_transactions(self, transactions: List[Transaction]):
+        etags = []
         for transaction in transactions:
-            self.tx_ref.push(transaction.to_dict())
+            ref = self.tx_ref.push(transaction.to_dict())
+            _, etag = ref.get(etag=True)
+            etags.append(f"{ref.key}:::{etag}")
+        return etags
+
+    def is_transaction_unconfirmed(self, tag: str):
+        key, etag = tag.split(":::")
+        changed, _, _ = self.tx_ref.child(key).get_if_changed(etag=etag)
+        return not changed
+
+    def num_transactions(self):
+        tx_keys = self.tx_ref.get(shallow=True)
+        return len(tx_keys)
 
 class InMemoryBlockchatStorage(BlockchatStorage):
     """Blockchain storage provider which stores the chain and transactions in memory (as lists)"""
     def __init__(self):
         self.current_chain: List[Dict] = []
-        self.transactions: List[Transaction] = []
+        self.transactions: Dict = dict()
         self.nodes_set: Set[str] = set()
         super().__init__()
 
@@ -185,9 +243,32 @@ class InMemoryBlockchatStorage(BlockchatStorage):
         return self.current_chain[-1]
 
     def pop_transactions(self) -> List[Transaction]:
-        transactions = copy.deepcopy(self.transactions)
-        self.transactions = []
+        transactions = []
+        try:
+            while True:
+                _, transaction = self.transactions.popitem()
+                transactions.append(transaction)
+        except KeyError:
+            pass
         return transactions
 
     def append_transactions(self, transactions: List[Transaction]):
-        self.transactions.extend(transactions)
+        tags = []
+        for transaction in transactions:
+            tag = str(uuid.uuid4())
+            tags.append(tag)
+            self.transactions[tag] = transaction
+        return tags
+
+    def is_transaction_unconfirmed(self, tag):
+        return tag in self.transactions
+
+    def is_transaction_confirmed(self, tag):
+        for block in reversed(self.current_chain):
+            for transaction in block["transactions"]:
+                if transaction.tag == tag:
+                    return True
+        return False
+
+    def num_transactions(self):
+        return len(self.transactions)

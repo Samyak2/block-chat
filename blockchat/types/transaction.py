@@ -9,11 +9,13 @@ class Transaction:
     receiver (bytes): receiver public key
     message (str): message to be sent
     """
-    def __init__(self, sender: bytes, receiver: bytes, message: str, signature: str = None):
+    def __init__(self, sender: bytes, receiver: bytes, message: str, signature: str = None,
+                 tag: str = None):
         self.sender = sender
         self.receiver = receiver
         self.message = message
         self.signature = signature
+        self.tag = tag
         if signature is not None:
             self.signature = bytes.fromhex(signature)
 
@@ -26,7 +28,8 @@ class Transaction:
             "sender": self.sender,
             "receiver": self.receiver,
             "message": self.message,
-            "signature": self.signature.hex()
+            "signature": self.signature.hex(),
+            "tag": self.tag
         }
 
     def verify_transaction(self):
