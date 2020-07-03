@@ -6,7 +6,7 @@ import json
 from time import time
 from urllib.parse import urlparse
 
-from flask.json import JSONEncoder, JSONDecoder
+from quart.json import JSONEncoder, JSONDecoder
 import nacl.signing
 import requests
 
@@ -143,13 +143,13 @@ class Blockchain:
 
         # Grab and verify the chains from all the nodes in our network
         for node in neighbours:
-            response = requests.get(f'http://{node}/chain_length')
+            response = requests.get(f'http://{node}/chain/length')
 
             if response.status_code == 200:
                 length = response.json()['length']
                 # check if length is longer
                 if length > max_length:
-                    chain_response = requests.get(f'http://{node}/chain')
+                    chain_response = requests.get(f'http://{node}/chain/get')
                     if chain_response.status_code == 200:
                         chain = chain_response.json(cls=BlockchatJSONDecoder)['chain']
                         # Check if the chain is valid
@@ -196,7 +196,7 @@ class Blockchain:
         headers = {'Content-type': 'application/json', 'Accept': 'text/plain'}
         for node in self.get_nodes():
             if node != block["source_node"]:
-                response = requests.post(f'http://{node}/add_block',
+                response = requests.post(f'http://{node}/block/add',
                                          data=json.dumps({"block": block},
                                                          cls=BlockchatJSONEncoder),
                                          headers=headers)
@@ -253,7 +253,7 @@ class Blockchain:
             tag = None
         transaction.tag = tag
 
-        return tag
+        return transaction, tag
 
     @property
     def last_block(self):

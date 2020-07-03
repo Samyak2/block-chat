@@ -1,6 +1,6 @@
 # Use the official lightweight Python image.
 # https://hub.docker.com/_/python
-FROM python:3.7-slim
+FROM python:3.8-slim
 
 # Allow statements and log messages to immediately appear in the Knative logs
 ENV PYTHONUNBUFFERED True
@@ -26,4 +26,6 @@ COPY . ./
 # webserver, with one worker process and 8 threads.
 # For environments with multiple CPU cores, increase the number of workers
 # to be equal to the cores available.
-CMD exec gunicorn --bind :$PORT --workers 1 --threads 1 --timeout 0 blockchat.app:app
+CMD exec hypercorn --bind :$PORT \
+    --websocket-ping-interval 5 \
+    --workers 1 blockchat.app:app

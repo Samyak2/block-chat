@@ -6,6 +6,7 @@ Current plan:
 
 import abc
 import logging
+from collections import OrderedDict
 from typing import List, Dict, Set
 import uuid
 
@@ -132,6 +133,18 @@ class BlockchatStorage(abc.ABC):
         """
         return NotImplementedError
 
+    @abc.abstractmethod
+    def get_user_messages(self, user_key):
+        """Returns all the transactions (mined + unconfirmed) which involve the user
+            given by user_key.
+
+        :param user_key: the user's public key
+        :type user_key: str
+
+        :return: list of :class:`~blockchat.type.transaction.Transaction` objects
+        """
+        return NotImplementedError
+
 class FirebaseBlockchatStorage(BlockchatStorage):
     """Blockchain storage provider with Firebase firestore and realtime database"""
     def __init__(self):
@@ -217,7 +230,7 @@ class InMemoryBlockchatStorage(BlockchatStorage):
     """Blockchain storage provider which stores the chain and transactions in memory (as lists)"""
     def __init__(self):
         self.current_chain: List[Dict] = []
-        self.transactions: Dict = dict()
+        self.transactions: OrderedDict = OrderedDict()
         self.nodes_set: Set[str] = set()
         super().__init__()
 
@@ -246,7 +259,7 @@ class InMemoryBlockchatStorage(BlockchatStorage):
         transactions = []
         try:
             while True:
-                _, transaction = self.transactions.popitem()
+                _, transaction = self.transactions.popitem(last=False)
                 transactions.append(transaction)
         except KeyError:
             pass
@@ -272,3 +285,19 @@ class InMemoryBlockchatStorage(BlockchatStorage):
 
     def num_transactions(self):
         return len(self.transactions)
+
+    def get_user_messages(self, user_key):
+        txs = []
+        for block in self.current_chain:
+            for transaction in block["transactions"]:
+                if user_key in (transaction.sender, transaction.receiver):
+                    tx = transaction.to_dict()
+                    tx["status"] = "mined"
+                    txs.append(tx)
+        for transaction in self.transactions:
+            if user_key in (transaction.sender, transaction.receiver):
+                tx = transaction.to_dict()
+                tx["status"] = "unc"
+                txs.append(tx)
+                txs.append(transaction)
+        return txs

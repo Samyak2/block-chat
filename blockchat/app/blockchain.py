@@ -1,11 +1,12 @@
 import os
 import logging
-import atexit
+import json
+import asyncio
+from collections import defaultdict
 
 import nacl
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-from apscheduler.schedulers.background import BackgroundScheduler
+from quart import Quart, jsonify, request, websocket
+from quart_cors import cors
 
 from blockchat.utils import encryption
 from blockchat.types.blockchain import Blockchain, BlockchatJSONEncoder, BlockchatJSONDecoder
@@ -18,8 +19,8 @@ if not isinstance(numeric_level, int):
 logging.basicConfig(level=numeric_level)
 
 # Instantiate the Node
-app = Flask(__name__)
-CORS(app)
+app = Quart(__name__)
+app = cors(app, allow_origin="*")
 
 app.json_encoder = BlockchatJSONEncoder
 app.json_decoder = BlockchatJSONDecoder
@@ -42,16 +43,68 @@ else:
 # Instantiate the Blockchain
 blockchain = Blockchain(db, node_url, node_secret)
 
-def mine_wrapper():
+monitor_tags = defaultdict(set)
+monitor_chats = defaultdict(set)
+
+@app.websocket('/transactions/ws')
+async def transaction_socket():
+    global monitor_tags
+    if 'tag' not in websocket.args:
+        return 'Tag not specified'
+    tag = websocket.args.get('tag')
+    queue = asyncio.Queue()
+    monitor_tags[tag].add(queue)
+    await websocket.accept()
+    if blockchain.db.is_transaction_unconfirmed(tag):
+        await websocket.send('unc')
+    elif blockchain.db.is_transaction_confirmed(tag):
+        await websocket.send('mined')
+    try:
+        while True:
+            data = await queue.get()
+            await websocket.send(data)
+            if data == "mined":
+                break
+    finally:
+        monitor_tags[tag].remove(queue)
+        if not monitor_tags[tag]:
+            monitor_tags.pop(tag)
+
+@app.websocket('/chat/ws')
+async def chat_socket():
+    global monitor_chats
+    if 'sender' not in websocket.args:
+        return 'Sender address not specified'
+    sender = websocket.args.get('sender')
+    queue = asyncio.Queue()
+    monitor_chats[sender].add(queue)
+    logging.info("Monitoring sender %s", sender)
+    await websocket.accept()
+    try:
+        while True:
+            data = await queue.get()
+            await websocket.send(data)
+    finally:
+        monitor_chats[sender].remove(queue)
+        if not monitor_tags[sender]:
+            monitor_chats.pop(sender)
+
+async def mine_wrapper():
     if blockchain.db.num_transactions() == 0:
         return False
     logging.info("Mining now")
+    # get the transactions to be added
+    transactions = blockchain.db.pop_transactions()
+    # let client know that their transaction is being mined
+    for transaction in transactions:
+        if transaction.tag in monitor_tags:
+            asyncio.gather(*(mtag.put('mining') for mtag in monitor_tags[transaction.tag]))
+
     # ensure chain is the best before mining
     blockchain.resolve_conflicts()
 
     last_block = blockchain.last_block
-    # get the transactions to be added
-    transactions = blockchain.db.pop_transactions()
+
     # add a "mine" transaction
     blockchain.new_transaction(node_identifier, node_identifier, "<<MINE>>",
                                self_sign=True, add_to=transactions)
@@ -63,11 +116,16 @@ def mine_wrapper():
     previous_hash = blockchain.hash(last_block)
     block = blockchain.new_block(proof, previous_hash, transactions, last_block)
 
+    for transaction in transactions:
+        if transaction.tag in monitor_tags:
+            asyncio.gather(*(mtag.put('mined') for mtag in monitor_tags[transaction.tag]))
+    logging.info("Mined")
+
     return block
 
-@app.route('/mine', methods=['GET'])
-def mine():
-    block = mine_wrapper()
+@app.route('/block/mine', methods=['GET'])
+async def mine():
+    block = await mine_wrapper()
     if not block:
         return "Nothing to mine", 200
 
@@ -80,28 +138,49 @@ def mine():
     }
     return jsonify(response), 200
 
+@app.route('/chat/messages', methods=['GET'])
+async def get_messages():
+    if not 'user_key' in request.args:
+        return 'User public key missing', 400
+    user_key = request.args.get('user_key').strip()
+    if not user_key:
+        return 'Invalid user public key', 400
+
+    txs = blockchain.db.get_user_messages(user_key)
+    num_txs = len(txs)
+
+    response = {
+        'transactions': txs,
+        'length': num_txs
+    }
+    return jsonify(response), 200
 
 @app.route('/transactions/new', methods=['POST'])
-def new_transaction():
-    values = request.get_json()
+async def new_transaction():
+    values = await request.get_json()
 
     # Check that the required fields are in the POST'ed data
-    required = ['sender', 'recipient', 'message', 'signature']
-    if not all(k in values for k in required):
+    required_values = ['sender', 'recipient', 'message', 'signature']
+    if not all(k in values for k in required_values):
         return 'Missing values', 400
 
     # Create a new Transaction
-    tag = blockchain.new_transaction(values['sender'], values['recipient'],
-                                     values['message'], values['signature'])
+    transaction, tag = blockchain.new_transaction(values['sender'], values['recipient'],
+                                                  values['message'], values['signature'])
     if not tag:
         return "Cannot verify transaction", 400
+
+    if transaction.receiver in monitor_chats:
+        json_dump = json.dumps(transaction.to_dict())
+        await asyncio.gather(*(mchat.put(json_dump) for mchat in
+                               monitor_chats[transaction.receiver]))
 
     response = {'message': 'Transaction will be added to the next block.',
                 'tag': tag}
     return jsonify(response), 201
 
 @app.route('/transactions/is_unconfirmed', methods=['GET'])
-def check_transaction_unconfirmed():
+async def check_transaction_unconfirmed():
     if 'tag' not in request.args:
         return 'Missing tag in parameters', 400
     tag = request.args.get('tag')
@@ -109,15 +188,15 @@ def check_transaction_unconfirmed():
     return jsonify({"unconfirmed": unconfirmed}), 201
 
 @app.route('/transactions/is_confirmed', methods=['GET'])
-def check_transaction_confirmed():
+async def check_transaction_confirmed():
     if 'tag' not in request.args:
         return 'Missing tag in parameters', 400
     tag = request.args.get('tag')
     confirmed = blockchain.db.is_transaction_confirmed(tag)
     return jsonify({"confirmed": confirmed}), 201
 
-@app.route('/chain', methods=['GET'])
-def full_chain():
+@app.route('/chain/get', methods=['GET'])
+async def full_chain():
     chain = blockchain.db.chain
     response = {
         'chain': chain,
@@ -125,16 +204,16 @@ def full_chain():
     }
     return jsonify(response), 200
 
-@app.route('/chain_length', methods=['GET'])
-def chain_length():
+@app.route('/chain/length', methods=['GET'])
+async def chain_length():
     response = {
         'length': len(blockchain),
     }
     return jsonify(response), 200
 
-@app.route('/add_block', methods=['POST'])
-def add_block():
-    values = request.get_json()
+@app.route('/block/add', methods=['POST'])
+async def add_block():
+    values = await request.get_json()
     block_to_add = values.get('block')
 
     # try to add block
@@ -146,8 +225,8 @@ def add_block():
     return "Error: Invalid block", 400
 
 @app.route('/nodes/register', methods=['POST'])
-def register_nodes():
-    values = request.get_json()
+async def register_nodes():
+    values = await request.get_json()
 
     nodes = values.get('nodes')
     if nodes is None:
@@ -167,7 +246,7 @@ def register_nodes():
 
 
 @app.route('/nodes/resolve', methods=['GET'])
-def consensus():
+async def consensus():
     replaced = blockchain.resolve_conflicts()
 
     if replaced:
@@ -182,12 +261,13 @@ def consensus():
     return jsonify(response), 200
 
 # schedule mine job every x minutes
-sched = BackgroundScheduler(daemon=True)
-sched.add_job(mine_wrapper, 'interval', minutes=1)
-sched.start()
-
-# shutdown scheduler when exiting
-atexit.register(lambda: sched.shutdown(wait=False))
+@app.before_first_request
+async def mine_job_req():
+    asyncio.create_task(mine_job())
+async def mine_job():
+    while True:
+        await asyncio.sleep(10)
+        await mine_wrapper()
 
 if __name__ == '__main__':
     from argparse import ArgumentParser
